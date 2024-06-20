@@ -281,7 +281,7 @@ func (gcas *GCAServer) migrateReports(username, password string) {
 	}
 	// Save the device stats.
 	gcas.mu.Lock()
-	stats, err := gcas.buildDeviceStats(gcas.equipmentReportsOffset)
+	stats, _, err := gcas.buildDeviceStats(gcas.equipmentReportsOffset)
 	if err != nil {
 		panic("unable to build device stats: " + err.Error())
 	}

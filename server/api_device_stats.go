@@ -40,9 +40,30 @@ type DeviceStats struct {
 	ImpactRates  [2016]float64
 }
 
+//  DeviceStatsFriendlyJSON is strictly for JSON encoding
+// It is a friendly version of DeviceStats that includes the PublicKey as a hex string
+// and also includes the ShortId of the device to avoid having to look it up in another HTTP request
+// It contains pointers to the arrays to avoid copying the data
+// DeviceStatsFriendlyJSON's lifetime is limited to the HTTP request by design
+type DeviceStatsFriendlyJSON struct {
+	PublicKey    string
+	ShortId 	 *uint32
+	PowerOutputs *[2016]uint64
+	ImpactRates  *[2016]float64
+}
+
 // AllDeviceStats contains aggregate weekly statistics
 type AllDeviceStats struct {
 	Devices        []DeviceStats // A set of data for each device
+	TimeslotOffset uint32        // Establish what week is covered by the data
+	Signature      glow.Signature
+}
+
+// AllDeviceStatsFriendlyJSON is strictly for JSON encoding
+// It is a friendly version of AllDeviceStats that includes the PublicKey as a hex string
+// and also includes the ShortId of the device to avoid having to look it up in another HTTP request
+type AllDeviceStatsFriendlyJSON struct {
+	Devices        []DeviceStatsFriendlyJSON // A set of data for each device
 	TimeslotOffset uint32        // Establish what week is covered by the data
 	Signature      glow.Signature
 }
@@ -197,6 +218,29 @@ func (ds DeviceStats) MarshalJSON() ([]byte, error) {
     })
 }
 
+// MarshalJSON will encode underflowed uint64 values as negative values when it
+// reports in JSON.
+//
+// NOTE: Code was written by GPT 4, but it appears to function correctly.
+func (ds DeviceStatsFriendlyJSON) MarshalJSON() ([]byte, error) {
+    // Convert PowerOutputs from uint64 to int64
+    powerOutputsAsInt := make([]int64, len(ds.PowerOutputs))
+    for i, val := range ds.PowerOutputs {
+        powerOutputsAsInt[i] = int64(val)
+    }
+
+    // Use an anonymous struct to leverage the default JSON marshaling
+    // for types that don't need custom handling
+    type Alias DeviceStatsFriendlyJSON
+    return json.Marshal(&struct {
+        PowerOutputs []int64 `json:"PowerOutputs"`
+        *Alias
+    }{
+        PowerOutputs: powerOutputsAsInt,
+        Alias:        (*Alias)(&ds),
+    })
+}
+
 // AllDeviceStatsHandler will return the statistics on all of the devices for
 // the requested week.
 func (s *GCAServer) AllDeviceStatsHandler(w http.ResponseWriter, r *http.Request) {
@@ -231,13 +275,18 @@ func (s *GCAServer) AllDeviceStatsHandler(w http.ResponseWriter, r *http.Request
 	// Check whether we need to return all of the current values, or if we
 	// need to return
 	var stats AllDeviceStats
+	//Initialize shortIds to store the shortIds of the devices in case of friendly JSON param
+	var shortIds []uint32
 	s.mu.Lock()
 	if tso < s.equipmentReportsOffset {
 		relativeTSO := tso - s.equipmentHistoryOffset
 		stats = s.equipmentStatsHistory[relativeTSO/2016]
+		for _, device := range stats.Devices {
+			shortIds = append(shortIds, s.equipmentShortID[device.PublicKey])
+		}
 		s.mu.Unlock()
 	} else {
-		stats, err = s.buildDeviceStats(tso)
+		stats, shortIds, err = s.buildDeviceStats(tso)
 		s.mu.Unlock()
 		if err != nil {
 			http.Error(w, "unable to build stats for the provided timeslot: "+err.Error(), http.StatusInternalServerError)
@@ -269,7 +318,28 @@ func (s *GCAServer) AllDeviceStatsHandler(w http.ResponseWriter, r *http.Request
 			}
 		}
 	}
+	// If the friendly_json query parameter is set to true, return the friendly JSON
+	// Casting the PowerOutputs as int64 to avoid overflow is handled in the JSON encoding
+	wantFriendlyJSONStr := r.URL.Query().Get("friendly_json")
+	if  wantFriendlyJSONStr == "true" {
+		var statsFriendly AllDeviceStatsFriendlyJSON
+		for i, device := range stats.Devices {
+			var deviceFriendly DeviceStatsFriendlyJSON
+			deviceFriendly.PublicKey = device.PublicKey.ToHexString()
+			deviceFriendly.ShortId =  &shortIds[i]
+			deviceFriendly.PowerOutputs = &device.PowerOutputs
+			deviceFriendly.ImpactRates = &device.ImpactRates
+			statsFriendly.Devices = append(statsFriendly.Devices, deviceFriendly)
+		}
+		statsFriendly.TimeslotOffset = stats.TimeslotOffset
+		statsFriendly.Signature = stats.Signature
+		if err := json.NewEncoder(w).Encode(statsFriendly); err != nil {
+			http.Error(w, "Failed to encode JSON response", http.StatusInternalServerError)
+			return
+		}
+	}
 
+	
 	// Send the response as JSON with a status code of OK
 	if err := json.NewEncoder(w).Encode(stats); err != nil {
 		http.Error(w, "Failed to encode JSON response", http.StatusInternalServerError)
@@ -277,22 +347,24 @@ func (s *GCAServer) AllDeviceStatsHandler(w http.ResponseWriter, r *http.Request
 	}
 }
 
+
+
 // managedBuildDeviceStats will build a DeviceStats object for the provided
 // timeslot offset.
-func (s *GCAServer) buildDeviceStats(timeslotOffset uint32) (ads AllDeviceStats, err error) {
+func (s *GCAServer) buildDeviceStats(timeslotOffset uint32) (ads AllDeviceStats, shortIds []uint32, err error) {
 	// Check that timeslotOffset is in a range where the ads can be built.
 	if timeslotOffset%2016 != 0 {
-		return ads, fmt.Errorf("timeslotOffset must be a multiple of 2016")
+		return ads,shortIds, fmt.Errorf("timeslotOffset must be a multiple of 2016")
 	}
 	if timeslotOffset < s.equipmentReportsOffset {
-		return ads, fmt.Errorf("timeslotOffset must not predate the current equipment offset")
+		return ads,shortIds, fmt.Errorf("timeslotOffset must not predate the current equipment offset")
 	}
 	var x int
 	if timeslotOffset == s.equipmentReportsOffset+2016 {
 		x = 2016
 	}
 	if timeslotOffset > s.equipmentReportsOffset+2016 {
-		return ads, fmt.Errorf("timeslotOffset must not be in the future")
+		return ads, shortIds, fmt.Errorf("timeslotOffset must not be in the future")
 	}
 
 	// Build the ads.
@@ -304,11 +376,12 @@ func (s *GCAServer) buildDeviceStats(timeslotOffset uint32) (ads AllDeviceStats,
 		}
 		copy(ds.ImpactRates[:], s.equipmentImpactRate[shortID][x:])
 		ads.Devices = append(ads.Devices, ds)
+		shortIds = append(shortIds, shortID)
 	}
 
 	// Set the timeslot offset and add a signature.
 	ads.TimeslotOffset = timeslotOffset
 	sb := ads.SigningBytes()
 	ads.Signature = glow.Sign(sb, s.staticPrivateKey)
-	return ads, nil
+	return ads,shortIds, nil
 }
