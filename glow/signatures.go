@@ -9,6 +9,12 @@ import (
 // PublicKey represents a 32-byte public key.
 type PublicKey [32]byte
 
+
+// Returns the public key as a hex string
+func (pk PublicKey) ToHexString() string {
+	return "0x" + fmt.Sprintf("%x", pk)
+}
+
 // PrivateKey represents a 32-byte private key.
 type PrivateKey [32]byte
 
